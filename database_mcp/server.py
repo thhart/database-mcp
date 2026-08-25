@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 
 import psycopg
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import ConnectionPool
 
 from mcp.server import MCPServer
@@ -23,6 +23,7 @@ from mcp.server import MCPServer
 from . import render
 from .pager import CursorExpired, CursorRegistry
 from .profiles import ProfileStore, redact_dsn
+from .tunnel import Tunnel, TunnelError
 
 # statements Postgres can serve through DECLARE ... CURSOR
 CURSORABLE = re.compile(r"^\s*(select|with|values|table)\b", re.IGNORECASE)
@@ -60,32 +61,53 @@ def clamp_page_size(args: dict, limits: Limits) -> int:
 
 
 class Engine:
-    """One profile's connection pool and query logic."""
+    """One profile's connection pool, optional SSH tunnel, and query logic."""
 
-    def __init__(self, name: str, dsn: str, allow_writes: bool, limits: Limits, registry: CursorRegistry):
+    def __init__(self, name: str, spec: dict, limits: Limits, registry: CursorRegistry):
         self.name = name
-        self.allow_writes = allow_writes
+        self.allow_writes = bool(spec.get("allow_writes"))
         self.limits = limits
         self.registry = registry
+        self.tunnel: Tunnel | None = None
+
+        dsn = spec["dsn"]
+        overrides: dict = {}
+        ssh = spec.get("ssh")
+        if ssh:
+            info = conninfo_to_dict(dsn)
+            remote_host = ssh.get("remote_host") or info.get("host") or "127.0.0.1"
+            if remote_host == ssh["host"].split("@")[-1]:
+                # DSN host == ssh host: from the remote's view that is localhost
+                remote_host = "127.0.0.1"
+            remote_port = int(ssh.get("remote_port") or info.get("port") or 5432)
+            self.tunnel = Tunnel(ssh["host"], remote_host, remote_port)
+            overrides = {"host": "127.0.0.1", "port": self.tunnel.local_port}
+
         options = (
             f"-c statement_timeout={int(limits.statement_timeout * 1000)} "
             f"-c idle_in_transaction_session_timeout={int((limits.cursor_ttl + 60) * 1000)}"
         )
         self.pool = ConnectionPool(
-            make_conninfo(dsn, options=options),
+            make_conninfo(dsn, options=options, **overrides),
             min_size=0,
             max_size=limits.max_cursors + 2,
             open=False,
             configure=self._configure_conn,
         )
+        self.pool.open()  # min_size=0: marks the pool usable, connects nothing
 
     def _configure_conn(self, conn):
         if not self.allow_writes:
             conn.read_only = True
 
+    def tunnel_ok(self) -> bool:
+        return self.tunnel is None or self.tunnel.alive()
+
     def close(self):
         self.registry.close_profile(self.name)
         self.pool.close()
+        if self.tunnel is not None:
+            self.tunnel.close()
 
     # -- query -------------------------------------------------------------
 
@@ -278,7 +300,7 @@ class Manager:
             if handler is None:
                 return {"error": f"unknown tool: {name}"}
             return handler(args)
-        except (CursorExpired, UserError) as e:
+        except (CursorExpired, UserError, TunnelError) as e:
             return {"error": str(e)}
         except psycopg.Error as e:
             msg = str(e).strip()
@@ -298,8 +320,12 @@ class Manager:
             known = ", ".join(self.store.profiles) or "none"
             raise UserError(f"unknown profile '{name}' (known: {known})")
         eng = self.engines.get(name)
+        if eng is not None and not eng.tunnel_ok():
+            # tunnel died: cursors on it are gone, rebuild engine lazily
+            self._drop_engine(name)
+            eng = None
         if eng is None:
-            eng = Engine(name, spec["dsn"], bool(spec.get("allow_writes")), self.limits, self.registry)
+            eng = Engine(name, spec, self.limits, self.registry)
             self.engines[name] = eng
         return eng
 
@@ -311,6 +337,13 @@ class Manager:
             raise UserError("cursor is required")
         page_size = clamp_page_size(args, self.limits)
         pq = self.registry.get(token)
+        eng = self.engines.get(pq.profile)
+        if eng is not None and not eng.tunnel_ok():
+            self._drop_engine(pq.profile)
+            raise TunnelError(
+                f"ssh tunnel for profile '{pq.profile}' went down — its cursors "
+                "are invalidated; re-run the query (the tunnel restarts automatically)"
+            )
         rows, has_more = pq.fetch_page(page_size, self.limits.max_page_bytes, self.limits.max_cell)
         columns = [d.name for d in pq.cursor.description] if pq.cursor.description else []
         page = {
@@ -342,6 +375,7 @@ class Manager:
                     "read_only": not spec.get("allow_writes"),
                     "description": spec.get("description"),
                     "connected": name in self.engines,
+                    **({"ssh": spec["ssh"]} if spec.get("ssh") else {}),
                 }
                 for name, spec in self.store.profiles.items()
             ],
@@ -352,11 +386,23 @@ class Manager:
         dsn = (args.get("dsn") or "").strip()
         if not name or not dsn:
             raise UserError("name and dsn are required")
+        ssh = None
+        if args.get("ssh_host"):
+            ssh = {"host": args["ssh_host"]}
+            if args.get("ssh_remote_host"):
+                ssh["remote_host"] = args["ssh_remote_host"]
+            if args.get("ssh_remote_port"):
+                ssh["remote_port"] = int(args["ssh_remote_port"])
+
         result = {"saved": name}
-        if args.get("test", True):
+        test = args.get("test", True)
+        if test and ssh is None:
             version, ms = self._probe(dsn)
             result["server"] = version
             result["connect_ms"] = ms
+
+        old_spec = self.store.profiles.get(name)
+        old_default = self.store.default
         self._drop_engine(name)  # replacing an existing profile: fresh pool
         self.store.upsert(
             name,
@@ -364,7 +410,28 @@ class Manager:
             allow_writes=bool(args.get("allow_writes")),
             description=args.get("description"),
             make_default=bool(args.get("make_default")),
+            ssh=ssh,
         )
+        if test and ssh is not None:
+            # ssh profiles can only be probed through their tunnel: build the
+            # engine, verify, and roll the store back if that fails
+            t0 = time.monotonic()
+            try:
+                eng = self.engine(name)
+                with eng.pool.connection() as conn:
+                    version = conn.execute("select version()").fetchone()[0]
+            except Exception:
+                self._drop_engine(name)
+                if old_spec is not None:
+                    self.store.profiles[name] = old_spec
+                    self.store.default = old_default
+                    self.store.save()
+                else:
+                    self.store.remove(name)
+                raise
+            result["server"] = version.split(" on ")[0]
+            result["connect_ms"] = round((time.monotonic() - t0) * 1000, 1)
+            result["tunnel"] = eng.tunnel.describe()
         result["default"] = self.store.default
         return result
 
@@ -381,6 +448,17 @@ class Manager:
         spec = self.store.profiles.get(name or "")
         if spec is None:
             raise UserError(f"unknown profile '{name}'")
+        if spec.get("ssh"):
+            t0 = time.monotonic()
+            eng = self.engine(name)
+            with eng.pool.connection() as conn:
+                version = conn.execute("select version()").fetchone()[0]
+            return {
+                "profile": name,
+                "server": version.split(" on ")[0],
+                "connect_ms": round((time.monotonic() - t0) * 1000, 1),
+                "tunnel": eng.tunnel.describe(),
+            }
         version, ms = self._probe(spec["dsn"])
         return {"profile": name, "server": version, "connect_ms": ms}
 
@@ -410,6 +488,8 @@ class Manager:
             if eng is not None:
                 stats = eng.pool.get_stats()
                 entry["pool"] = {k: v for k, v in stats.items() if v}
+                if eng.tunnel is not None:
+                    entry["tunnel"] = eng.tunnel.describe()
             profs.append(entry)
         return {
             "default": self.store.default,
@@ -422,7 +502,7 @@ class Manager:
     def shutdown(self):
         self.registry.close_all()
         for eng in self.engines.values():
-            eng.pool.close()
+            eng.close()
 
 
 # -- MCP wiring ------------------------------------------------------------
@@ -530,7 +610,12 @@ def build_server(mgr: Manager) -> MCPServer:
             "Add or update a named connection profile at runtime and persist it. "
             "Tests the connection first (set test=false to skip). Profiles are "
             "read-only unless allow_writes=true. make_default=true switches the "
-            "default profile."
+            "default profile. For a database only reachable via SSH, set "
+            "ssh_host (an ssh destination or ~/.ssh/config alias; BatchMode, so "
+            "keys/agent must work non-interactively) — a tunnel is opened "
+            "automatically and kept alive; ssh_remote_host/ssh_remote_port "
+            "default to the DSN's host/port as seen FROM the ssh host "
+            "(usually 127.0.0.1:5432)."
         )
     )
     async def profile_add(
@@ -540,6 +625,9 @@ def build_server(mgr: Manager) -> MCPServer:
         description: str | None = None,
         make_default: bool = False,
         test: bool = True,
+        ssh_host: str | None = None,
+        ssh_remote_host: str | None = None,
+        ssh_remote_port: int | None = None,
     ) -> str:
         return await _call(
             "profile_add",
@@ -550,6 +638,9 @@ def build_server(mgr: Manager) -> MCPServer:
                 "description": description,
                 "make_default": make_default,
                 "test": test,
+                "ssh_host": ssh_host,
+                "ssh_remote_host": ssh_remote_host,
+                "ssh_remote_port": ssh_remote_port,
             },
         )
 

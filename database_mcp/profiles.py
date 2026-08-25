@@ -45,12 +45,16 @@ class ProfileStore:
         allow_writes: bool = False,
         description: str | None = None,
         make_default: bool = False,
+        ssh: dict | None = None,
     ):
-        self.profiles[name] = {
+        spec = {
             "dsn": dsn,
             "allow_writes": bool(allow_writes),
             "description": description,
         }
+        if ssh:
+            spec["ssh"] = ssh
+        self.profiles[name] = spec
         if make_default or self.default is None:
             self.default = name
         self.save()

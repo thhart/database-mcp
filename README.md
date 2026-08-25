@@ -38,6 +38,28 @@ Profiles are **read-only by default** (session-level
 `default_transaction_read_only`); writes need an explicit
 `allow_writes=true` profile.
 
+## SSH bridging
+
+A profile can reach a database that is only accessible via SSH (the classic
+"Postgres listens on localhost of a remote host" setup):
+
+```
+profile_add(name="prod", dsn="postgresql://app@dbhost:5432/app",
+            ssh_host="dbhost")
+```
+
+- The tunnel is a system-`ssh` subprocess (`-N -L`, BatchMode, keepalives) —
+  your `~/.ssh/config`, keys, and agent apply unchanged. Auth must work
+  non-interactively.
+- `ssh_remote_host`/`ssh_remote_port` default to the DSN's host/port as seen
+  *from* the SSH host; if the DSN host equals the SSH host it defaults to
+  `127.0.0.1` (the usual case).
+- Tunnels start lazily, are health-checked on every use, and are rebuilt
+  automatically. If a tunnel dies mid-pagination, its cursors are invalidated
+  with a clear error and the next query reconnects.
+- Multiplexing (`ControlMaster`) is explicitly disabled for tunnel
+  connections so the tunnel's lifetime is exactly the subprocess's lifetime.
+
 ## Tools
 
 | Tool | Purpose |

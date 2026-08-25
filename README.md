@@ -70,6 +70,13 @@ profile_add(name="prod", dsn="postgresql://app@dbhost:5432/app",
 | `tables` | List tables/views with row estimates and sizes |
 | `describe` | Columns, constraints, indexes of one table |
 | `explain` | Query plan (optionally `analyze`) |
+| `overview` | Orientation card: every table + row estimate + column names in one call |
+| `search_objects` | Find tables/columns/functions by name **or comment** |
+| `profile` | Column statistics from `pg_stats` — distributions without a scan |
+| `relations` | Foreign keys of a table, both directions |
+| `join_path` | Shortest FK path between two tables as a ready JOIN chain |
+| `count` | Instant planner estimate (optional `where`), `exact=true` for real `count(*)` |
+| `sample` | Genuinely random rows via `TABLESAMPLE` (no LIMIT bias) |
 | `profiles` / `profile_add` / `profile_remove` / `profile_test` | Runtime connection management |
 | `status` | Profiles, pools, open cursors, limits |
 

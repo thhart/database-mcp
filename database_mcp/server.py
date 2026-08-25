@@ -20,7 +20,7 @@ from psycopg_pool import ConnectionPool
 
 from mcp.server import MCPServer
 
-from . import render
+from . import discovery, render
 from .pager import CursorExpired, CursorRegistry
 from .profiles import ProfileStore, redact_dsn
 from .tunnel import Tunnel, TunnelError
@@ -309,6 +309,13 @@ class Manager:
                 "tables": lambda a: self.engine(a.get("profile")).tables(a),
                 "describe": lambda a: self.engine(a.get("profile")).describe(a),
                 "explain": lambda a: self.engine(a.get("profile")).explain(a),
+                "overview": lambda a: discovery.overview(self.engine(a.get("profile")), a),
+                "search_objects": lambda a: discovery.search_objects(self.engine(a.get("profile")), a),
+                "profile": lambda a: discovery.profile(self.engine(a.get("profile")), a),
+                "relations": lambda a: discovery.relations(self.engine(a.get("profile")), a),
+                "join_path": lambda a: discovery.join_path(self.engine(a.get("profile")), a),
+                "count": lambda a: discovery.count(self.engine(a.get("profile")), a),
+                "sample": lambda a: discovery.sample(self.engine(a.get("profile")), a),
                 "fetch": self.fetch,
                 "close": self.close_tool,
                 "status": self.status,
@@ -618,6 +625,80 @@ def build_server(mgr: Manager) -> MCPServer:
         return await _call(
             "explain", {"sql": sql, "params": params, "analyze": analyze, "profile": profile}
         )
+
+    @srv.tool(
+        description=(
+            "Orientation card for an unknown database: every table with row "
+            "estimate and its column names in ONE compact call — use this "
+            "before tables/describe round-trips. Optional table-name filter."
+        )
+    )
+    async def overview(filter: str | None = None, profile: str | None = None) -> str:
+        return await _call("overview", {"filter": filter, "profile": profile})
+
+    @srv.tool(
+        description=(
+            "Find tables, columns, and functions by name OR by comment "
+            "(pg_description — often the only documentation a schema has). "
+            "Answers 'where is the customer email?' in one call."
+        )
+    )
+    async def search_objects(term: str, limit: int = 50, profile: str | None = None) -> str:
+        return await _call("search_objects", {"term": term, "limit": limit, "profile": profile})
+
+    @srv.tool(
+        description=(
+            "Column statistics from pg_stats WITHOUT touching the table: "
+            "null fraction, distinct count (negative = fraction of rows, "
+            "-1 = unique), most common values with frequencies, histogram "
+            "bounds, physical correlation. Replaces exploratory "
+            "SELECT DISTINCT / GROUP BY scans."
+        )
+    )
+    async def profile(table: str, profile: str | None = None) -> str:
+        return await _call("profile", {"table": table, "profile": profile})
+
+    @srv.tool(description="Foreign keys of one table, both directions: what it references and what references it.")
+    async def relations(table: str, profile: str | None = None) -> str:
+        return await _call("relations", {"table": table, "profile": profile})
+
+    @srv.tool(
+        description=(
+            "Shortest foreign-key path between two tables, rendered as a "
+            "ready-to-use JOIN chain (up to 3 equally short paths). Use this "
+            "instead of guessing joins on unfamiliar schemas."
+        )
+    )
+    async def join_path(
+        from_table: str, to_table: str, max_hops: int = 4, profile: str | None = None
+    ) -> str:
+        return await _call(
+            "join_path",
+            {"from_table": from_table, "to_table": to_table, "max_hops": max_hops, "profile": profile},
+        )
+
+    @srv.tool(
+        description=(
+            "Row count, estimate-first: instant planner estimate (no scan), "
+            "optionally with a WHERE clause; exact=true runs a real count(*) "
+            "under the statement timeout. Prefer the estimate."
+        )
+    )
+    async def count(
+        table: str, where: str | None = None, exact: bool = False, profile: str | None = None
+    ) -> str:
+        return await _call(
+            "count", {"table": table, "where": where, "exact": exact, "profile": profile}
+        )
+
+    @srv.tool(
+        description=(
+            "A few genuinely random rows from a table (TABLESAMPLE on big "
+            "tables — no scan, no physically-adjacent LIMIT bias)."
+        )
+    )
+    async def sample(table: str, n: int = 5, profile: str | None = None) -> str:
+        return await _call("sample", {"table": table, "n": n, "profile": profile})
 
     @srv.tool(
         description="List all connection profiles (DSNs password-redacted) and which one is the default."

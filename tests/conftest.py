@@ -28,6 +28,22 @@ def seed():
             "create table dbmcp_test.big as "
             "select g as id, repeat('x', 500) as blob from generate_series(1, 50) g"
         )
+        conn.execute(
+            "create table dbmcp_test.child ("
+            " id int primary key,"
+            " t_id int not null references dbmcp_test.t(id))"
+        )
+        conn.execute(
+            "insert into dbmcp_test.child select g, g from generate_series(1, 100) g"
+        )
+        conn.execute(
+            "create table dbmcp_test.grand ("
+            " id int primary key,"
+            " child_id int references dbmcp_test.child(id))"
+        )
+        conn.execute("comment on table dbmcp_test.t is 'primary demo table'")
+        conn.execute("comment on column dbmcp_test.t.txt is 'human readable label'")
+        conn.execute("analyze dbmcp_test.t, dbmcp_test.child, dbmcp_test.grand")
     yield
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute("drop schema if exists dbmcp_test cascade")

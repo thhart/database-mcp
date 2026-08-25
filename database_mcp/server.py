@@ -536,16 +536,39 @@ class Manager:
 
 
 def build_server(mgr: Manager) -> MCPServer:
+    from . import __version__
+
     srv = MCPServer(
         name="database-mcp",
+        title="Database MCP",
+        version=__version__,
+        website_url="https://github.com/thhart/database-mcp",
+        description=(
+            "PostgreSQL access with true server-side result paging, "
+            "runtime-managed connection profiles (incl. SSH tunnels), and "
+            "scan-free schema discovery tools."
+        ),
         instructions=(
-            "SQL access to PostgreSQL with true server-side result paging and "
-            "runtime-managed connection profiles. Run SQL with the query tool; "
-            "when page.has_more is true, continue with fetch(cursor) — the "
-            "query is not re-executed, the page continues from a held "
-            "server-side cursor with a stable snapshot. Connections are named "
-            "profiles: list with profiles, switch per call via the profile "
-            "parameter, add/change on the fly with profile_add."
+            "SQL access to PostgreSQL with TRUE server-side result paging.\n"
+            "\n"
+            "PAGING: run SQL with `query`; when page.has_more is true, continue "
+            "with `fetch(cursor)` — the query is NOT re-executed, rows continue "
+            "from a held server-side cursor with a stable MVCC snapshot. "
+            "Results are compact: columns once, rows as arrays.\n"
+            "\n"
+            "UNKNOWN SCHEMA? Do NOT explore with ad-hoc SQL scans:\n"
+            "- `overview` — every table + row estimate + column names, one call\n"
+            "- `search_objects` — find tables/columns/functions by name OR comment\n"
+            "- `profile` — value distributions from pg_stats, zero table access\n"
+            "- `join_path` — shortest FK path as a ready JOIN chain (no guessed joins)\n"
+            "- `count` — instant planner estimate; exact=true only when needed\n"
+            "- `sample` — genuinely random rows (TABLESAMPLE, no LIMIT bias)\n"
+            "\n"
+            "CONNECTIONS are named profiles, managed at runtime: `profiles` "
+            "lists them, every tool takes profile=, `profile_add` creates or "
+            "changes one on the fly (ssh_host= opens a self-healing SSH tunnel "
+            "for databases only reachable via a jump host). Profiles are "
+            "read-only unless created with allow_writes=true."
         ),
     )
 

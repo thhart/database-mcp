@@ -125,6 +125,26 @@ Dead connections are detected fast at every layer instead of hanging:
   after `--keepalive` seconds; connection attempts fail after
   `--connect-timeout` (default 5 s) instead of the ~2 min TCP default.
 
+## Query log
+
+Every tool call is logged as one JSON line to a daily file
+(`~/.local/state/database-mcp/log/query-YYYYMMDD.jsonl`): timestamp, tool,
+profile, **duration in ms**, row counts, truncated SQL (2000 chars),
+error/sqlstate. Profile DSNs are never logged. Inspect recent entries with
+the `logs` tool (filter by tool/profile/since); for bigger analyses point
+duckdb/jq/pandas at the files:
+
+```sql
+-- duckdb: p95 query time per profile, last 14 days
+select profile, count(*) n, round(quantile_cont(ms, 0.95)) p95_ms
+from read_json_auto('~/.local/state/database-mcp/log/query-*.jsonl')
+where tool in ('query','fetch','script') group by 1 order by p95_ms desc;
+```
+
+**Retention is bounded by design**: daily rotation, files older than
+`--log-days` (default 14) are deleted at startup and on every rollover;
+`--log-days 0` disables logging, `--log-dir` moves it.
+
 ## Tests
 
 ```bash

@@ -22,6 +22,7 @@ from mcp.server import MCPServer
 
 from . import bulk, discovery, render
 from .pager import CursorExpired, CursorRegistry
+from .qlog import QueryLog, build_record
 from .profiles import ProfileStore, redact_dsn
 from .tunnel import Tunnel, TunnelError
 
@@ -301,15 +302,26 @@ class Engine:
 class Manager:
     """Routes tools to profile engines; owns the global cursor registry."""
 
-    def __init__(self, store: ProfileStore, limits: Limits):
+    def __init__(self, store: ProfileStore, limits: Limits, query_log: QueryLog | None = None):
         self.store = store
         self.limits = limits
         self.registry = CursorRegistry(limits.cursor_ttl, limits.max_cursors)
         self.engines: dict[str, Engine] = {}
+        self.qlog = query_log
 
     # -- dispatch ----------------------------------------------------------
 
     def dispatch(self, name: str, args: dict) -> dict:
+        t0 = time.monotonic()
+        result = self._dispatch_inner(name, args)
+        if self.qlog is not None and name != "logs":
+            self.qlog.write(
+                build_record(name, args, result,
+                             (time.monotonic() - t0) * 1000, self.store.default)
+            )
+        return result
+
+    def _dispatch_inner(self, name: str, args: dict) -> dict:
         try:
             handler = {
                 "query": lambda a: self.engine(a.get("profile")).query(a),
@@ -327,6 +339,7 @@ class Manager:
                 "sample": lambda a: discovery.sample(self.engine(a.get("profile")), a),
                 "fetch": self.fetch,
                 "close": self.close_tool,
+                "logs": self.logs,
                 "status": self.status,
                 "profiles": self.profiles_list,
                 "profile_add": self.profile_add,
@@ -513,7 +526,18 @@ class Manager:
         if eng is not None:
             eng.close()
 
-    # -- status ------------------------------------------------------------
+    # -- logs / status -----------------------------------------------------
+
+    def logs(self, args: dict) -> dict:
+        if self.qlog is None or not self.qlog.enabled:
+            return {"error": "query log disabled (--log-days 0 or no log dir)"}
+        entries = self.qlog.read(
+            limit=min(int(args.get("limit") or 50), 500),
+            tool=args.get("tool"),
+            profile=args.get("profile"),
+            since=args.get("since"),
+        )
+        return {"entries": entries, "log": self.qlog.status()}
 
     def status(self, args: dict) -> dict:
         self.registry.sweep()
@@ -537,12 +561,15 @@ class Manager:
             "open_cursors": self.registry.snapshot(),
             "limits": self.limits.as_dict(),
             "profiles_file": str(self.store.path),
+            "query_log": self.qlog.status() if self.qlog else {"enabled": False},
         }
 
     def shutdown(self):
         self.registry.close_all()
         for eng in self.engines.values():
             eng.close()
+        if self.qlog is not None:
+            self.qlog.close()
 
 
 # -- MCP wiring ------------------------------------------------------------
@@ -848,8 +875,27 @@ def build_server(mgr: Manager) -> MCPServer:
 
     @srv.tool(
         description=(
+            "Recent query-log entries (newest first): tool, profile, duration "
+            "ms, row counts, truncated SQL, errors. Filter by tool/profile/"
+            "since (ISO timestamp). The log lives as daily JSONL files — "
+            "analyse big windows with duckdb/jq on log.dir instead of "
+            "paging through this tool."
+        )
+    )
+    async def logs(
+        limit: int = 50,
+        tool: str | None = None,
+        profile: str | None = None,
+        since: str | None = None,
+    ) -> str:
+        return await _call(
+            "logs", {"limit": limit, "tool": tool, "profile": profile, "since": since}
+        )
+
+    @srv.tool(
+        description=(
             "Server status: profiles with pool statistics, open cursors, "
-            "configured limits, profiles file location."
+            "configured limits, profiles file location, query-log state."
         )
     )
     async def status() -> str:
@@ -898,6 +944,18 @@ def run():
         default=5.0,
         help="seconds before a connection attempt to a dead host fails",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=os.getenv("DATABASE_MCP_LOG_DIR")
+        or os.path.expanduser("~/.local/state/database-mcp/log"),
+        help="query log directory (JSONL, one file per day)",
+    )
+    parser.add_argument(
+        "--log-days",
+        type=int,
+        default=14,
+        help="query log retention in days (0 disables logging)",
+    )
     args = parser.parse_args()
 
     store = ProfileStore(args.profiles)
@@ -923,6 +981,7 @@ def run():
             keepalive=args.keepalive,
             connect_timeout=args.connect_timeout,
         ),
+        query_log=QueryLog(args.log_dir, args.log_days),
     )
     try:
         asyncio.run(build_server(mgr).run_stdio_async())

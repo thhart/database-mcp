@@ -447,7 +447,7 @@ class Manager:
         self.store.upsert(
             name,
             dsn,
-            allow_writes=bool(args.get("allow_writes")),
+            allow_writes=bool(args.get("allow_writes", True)),
             description=args.get("description"),
             make_default=bool(args.get("make_default")),
             ssh=ssh,
@@ -585,7 +585,8 @@ def build_server(mgr: Manager) -> MCPServer:
             "lists them, every tool takes profile=, `profile_add` creates or "
             "changes one on the fly (ssh_host= opens a self-healing SSH tunnel "
             "for databases only reachable via a jump host). Profiles are "
-            "read-only unless created with allow_writes=true."
+            "write-enabled by default; create production profiles with "
+            "allow_writes=false and treat them read-only."
         ),
     )
 
@@ -799,19 +800,20 @@ def build_server(mgr: Manager) -> MCPServer:
         description=(
             "Add or update a named connection profile at runtime and persist it. "
             "Tests the connection first (set test=false to skip). Profiles are "
-            "read-only unless allow_writes=true. make_default=true switches the "
-            "default profile. For a database only reachable via SSH, set "
-            "ssh_host (an ssh destination or ~/.ssh/config alias; BatchMode, so "
-            "keys/agent must work non-interactively) — a tunnel is opened "
-            "automatically and kept alive; ssh_remote_host/ssh_remote_port "
-            "default to the DSN's host/port as seen FROM the ssh host "
-            "(usually 127.0.0.1:5432)."
+            "write-enabled by default; pass allow_writes=false for a read-only "
+            "profile (recommended for production databases). make_default=true "
+            "switches the default profile. For a database only reachable via "
+            "SSH, set ssh_host (an ssh destination or ~/.ssh/config alias; "
+            "BatchMode, so keys/agent must work non-interactively) — a tunnel "
+            "is opened automatically and kept alive; ssh_remote_host/"
+            "ssh_remote_port default to the DSN's host/port as seen FROM the "
+            "ssh host (usually 127.0.0.1:5432)."
         )
     )
     async def profile_add(
         name: str,
         dsn: str,
-        allow_writes: bool = False,
+        allow_writes: bool = True,
         description: str | None = None,
         make_default: bool = False,
         test: bool = True,
@@ -872,7 +874,11 @@ def run():
         help="register/update the 'default' profile with this DSN at startup "
         "(env: DATABASE_MCP_DSN or DATABASE_URL)",
     )
-    parser.add_argument("--allow-writes", action="store_true", help="the --dsn profile may write")
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="register the --dsn profile read-only (writes are the default)",
+    )
     parser.add_argument("--page-size", type=int, default=50)
     parser.add_argument("--max-page-size", type=int, default=500)
     parser.add_argument("--max-page-bytes", type=int, default=32_000)
@@ -896,7 +902,7 @@ def run():
 
     store = ProfileStore(args.profiles)
     if args.dsn:
-        store.upsert("default", args.dsn, allow_writes=args.allow_writes, make_default=True)
+        store.upsert("default", args.dsn, allow_writes=not args.read_only, make_default=True)
     if not store.profiles:
         print(
             "database-mcp: no profiles configured yet — the AI can add one at "

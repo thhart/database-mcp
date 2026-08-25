@@ -42,7 +42,7 @@ class ProfileStore:
         self,
         name: str,
         dsn: str,
-        allow_writes: bool = False,
+        allow_writes: bool = True,
         description: str | None = None,
         make_default: bool = False,
         ssh: dict | None = None,

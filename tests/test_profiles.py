@@ -17,6 +17,14 @@ def test_profile_add_and_query_by_profile(make_db):
     listing = db.dispatch("profiles", {})
     names = {p["name"] for p in listing["profiles"]}
     assert names == {"test", "second"}
+    # profiles are write-enabled by default now
+    entry = next(p for p in listing["profiles"] if p["name"] == "second")
+    assert entry["read_only"] is False
+    r = db.dispatch(
+        "query",
+        {"sql": "create temp table wtest as select 1 as x", "profile": "second"},
+    )
+    assert "error" not in r, r
 
 
 def test_profile_add_persists(make_db):

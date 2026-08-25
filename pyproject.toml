@@ -1,6 +1,6 @@
 [project]
 name = "database-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "SQL database MCP server with true server-side result paging (PostgreSQL reference implementation)"
 readme = "README.md"
 license = "MIT"

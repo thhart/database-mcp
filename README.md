@@ -34,9 +34,11 @@ test, and remove them on the fly via tools — no server restart:
 - every query tool takes an optional `profile` parameter; the default profile
   is used when omitted.
 
-Profiles are **read-only by default** (session-level
-`default_transaction_read_only`); writes need an explicit
-`allow_writes=true` profile.
+Profiles are **write-enabled by default**. For production databases create
+the profile with `allow_writes=false` — that enforces read-only at the
+session level (`default_transaction_read_only`), so no statement can write
+regardless of what the model sends. The CLI `--dsn` profile follows the same
+default; pass `--read-only` to register it read-only.
 
 ## SSH bridging
 

@@ -19,6 +19,7 @@ class ProfileStore:
         self.path = Path(path) if path else DEFAULT_PATH
         self.default: str | None = None
         self.profiles: dict[str, dict] = {}
+        self._mtime: float | None = None
         self.load()
 
     def load(self):
@@ -28,6 +29,28 @@ class ProfileStore:
             self.default = data.get("default")
             if self.default not in self.profiles:
                 self.default = next(iter(self.profiles), None)
+            self._mtime = self.path.stat().st_mtime
+        else:
+            self._mtime = None
+
+    def maybe_reload(self) -> list[str]:
+        """Reload when another process/session wrote the file.
+
+        Returns the profile names whose spec changed or vanished, so the
+        caller can drop their cached engines.
+        """
+        try:
+            mtime = self.path.stat().st_mtime if self.path.exists() else None
+        except OSError:
+            return []
+        if mtime == self._mtime:
+            return []
+        old = self.profiles
+        self.load()
+        return [
+            n for n in set(old) | set(self.profiles)
+            if old.get(n) != self.profiles.get(n)
+        ]
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,6 +60,7 @@ class ProfileStore:
         )
         os.chmod(tmp, 0o600)
         tmp.replace(self.path)
+        self._mtime = self.path.stat().st_mtime
 
     def upsert(
         self,

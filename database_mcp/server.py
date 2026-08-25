@@ -11,6 +11,7 @@ import asyncio
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -308,11 +309,16 @@ class Manager:
         self.registry = CursorRegistry(limits.cursor_ttl, limits.max_cursors)
         self.engines: dict[str, Engine] = {}
         self.qlog = query_log
+        self._lock = threading.Lock()  # engines dict + store mutations (HTTP: concurrent sessions)
 
     # -- dispatch ----------------------------------------------------------
 
     def dispatch(self, name: str, args: dict) -> dict:
         t0 = time.monotonic()
+        with self._lock:
+            # another session/process may have edited the profiles file
+            for changed in self.store.maybe_reload():
+                self._drop_engine_locked(changed)
         result = self._dispatch_inner(name, args)
         if self.qlog is not None and name != "logs":
             self.qlog.write(
@@ -368,15 +374,16 @@ class Manager:
         if spec is None:
             known = ", ".join(self.store.profiles) or "none"
             raise UserError(f"unknown profile '{name}' (known: {known})")
-        eng = self.engines.get(name)
-        if eng is not None and not eng.tunnel_ok():
-            # tunnel died: cursors on it are gone, rebuild engine lazily
-            self._drop_engine(name)
-            eng = None
-        if eng is None:
-            eng = Engine(name, spec, self.limits, self.registry)
-            self.engines[name] = eng
-        return eng
+        with self._lock:
+            eng = self.engines.get(name)
+            if eng is not None and not eng.tunnel_ok():
+                # tunnel died: cursors on it are gone, rebuild engine lazily
+                self._drop_engine_locked(name)
+                eng = None
+            if eng is None:
+                eng = Engine(name, spec, self.limits, self.registry)
+                self.engines[name] = eng
+            return eng
 
     # -- cursor tools ------------------------------------------------------
 
@@ -522,6 +529,10 @@ class Manager:
         return version.split(" on ")[0], round((time.monotonic() - t0) * 1000, 1)
 
     def _drop_engine(self, name: str):
+        with self._lock:
+            self._drop_engine_locked(name)
+
+    def _drop_engine_locked(self, name: str):
         eng = self.engines.pop(name, None)
         if eng is not None:
             eng.close()
@@ -956,6 +967,14 @@ def run():
         default=14,
         help="query log retention in days (0 disables logging)",
     )
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="run as a shared HTTP daemon (bridge): ONE process serves ALL "
+        "Claude sessions — shared profiles, pools, tunnels, cursors, log",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind address")
+    parser.add_argument("--port", type=int, default=4270, help="HTTP port")
     args = parser.parse_args()
 
     store = ProfileStore(args.profiles)
@@ -984,7 +1003,15 @@ def run():
         query_log=QueryLog(args.log_dir, args.log_days),
     )
     try:
-        asyncio.run(build_server(mgr).run_stdio_async())
+        srv = build_server(mgr)
+        if args.http:
+            asyncio.run(
+                srv.run_streamable_http_async(
+                    host=args.host, port=args.port, stateless_http=True
+                )
+            )
+        else:
+            asyncio.run(srv.run_stdio_async())
     finally:
         mgr.shutdown()
 

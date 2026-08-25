@@ -125,6 +125,26 @@ Dead connections are detected fast at every layer instead of hanging:
   after `--keepalive` seconds; connection attempts fail after
   `--connect-timeout` (default 5 s) instead of the ~2 min TCP default.
 
+## Multi-session: the HTTP bridge
+
+By default the server speaks stdio (one process per MCP client). For several
+concurrent Claude sessions run it as a **shared bridge daemon** instead:
+
+```bash
+database-mcp --http --port 4270          # one daemon serves ALL sessions
+claude mcp add --transport http database http://127.0.0.1:4270/mcp -s user
+```
+
+One process means genuinely shared state: profiles added in one session are
+instantly visible in every other, connection pools and SSH tunnels exist
+once instead of per session, held cursors survive a client reconnect (within
+TTL), and the query log has a single writer. On macOS a LaunchAgent with
+`KeepAlive` makes the bridge permanent.
+
+stdio mode stays multi-session aware on a smaller scale: the profiles file
+is watched (mtime) and reloaded when another session changes it — but pools,
+tunnels, and cursors remain per-process there.
+
 ## Query log
 
 Every tool call is logged as one JSON line to a daily file

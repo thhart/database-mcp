@@ -1,6 +1,24 @@
 import time
 
+import psycopg
+
+from conftest import DSN
+
 SEL = "select id, txt from dbmcp_test.t order by id"
+
+
+def test_stale_pooled_connection_recovers_transparently(make_db):
+    """Server-side terminated backend: the checkout check must replace the
+    dead pooled connection without surfacing an error to the caller."""
+    db = make_db()
+    r = db.dispatch("query", {"sql": "select pg_backend_pid()"})
+    pid = r["rows"][0][0]
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute("select pg_terminate_backend(%s)", [pid])
+    time.sleep(0.2)
+    r = db.dispatch("query", {"sql": "select 1"})
+    assert "error" not in r, r
+    assert r["rows"] == [[1]]
 
 
 def test_first_page_and_full_pagination(make_db):

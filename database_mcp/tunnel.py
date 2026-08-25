@@ -21,32 +21,49 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def build_cmd(ssh_host: str, local_port: int, remote_host: str, remote_port: int, keepalive: float) -> list[str]:
+    return [
+        "ssh",
+        "-N",
+        "-o", "BatchMode=yes",  # never prompt: stdio MCP cannot answer
+        # a multiplexed client (ControlMaster in the user's config) hands
+        # the forward to the master and exits, breaking process-based
+        # lifecycle management — force a dedicated connection
+        "-o", "ControlMaster=no",
+        "-o", "ControlPath=none",
+        "-o", "ExitOnForwardFailure=yes",
+        # one missed probe declares the tunnel dead: the process exits and
+        # the engine manager rebuilds it lazily on next use
+        "-o", f"ServerAliveInterval={max(1, int(keepalive))}",
+        "-o", "ServerAliveCountMax=1",
+        "-o", "TCPKeepAlive=yes",
+        "-o", "ConnectTimeout=8",
+        "-L", f"127.0.0.1:{local_port}:{remote_host}:{remote_port}",
+        ssh_host,
+    ]
+
+
 class Tunnel:
-    def __init__(self, ssh_host: str, remote_host: str, remote_port: int, connect_timeout: float = 10.0):
+    def __init__(
+        self,
+        ssh_host: str,
+        remote_host: str,
+        remote_port: int,
+        connect_timeout: float = 10.0,
+        keepalive: float = 120.0,
+    ):
         self.ssh_host = ssh_host
         self.remote_host = remote_host
         self.remote_port = remote_port
+        self.keepalive = keepalive
         self.local_port = _free_port()
         self.proc: subprocess.Popen | None = None
         self._start(connect_timeout)
 
     def _start(self, timeout: float):
-        cmd = [
-            "ssh",
-            "-N",
-            "-o", "BatchMode=yes",  # never prompt: stdio MCP cannot answer
-            # a multiplexed client (ControlMaster in the user's config) hands
-            # the forward to the master and exits, breaking process-based
-            # lifecycle management — force a dedicated connection
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ConnectTimeout=8",
-            "-L", f"127.0.0.1:{self.local_port}:{self.remote_host}:{self.remote_port}",
-            self.ssh_host,
-        ]
+        cmd = build_cmd(
+            self.ssh_host, self.local_port, self.remote_host, self.remote_port, self.keepalive
+        )
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
         )

@@ -42,6 +42,8 @@ class Limits:
     cursor_ttl: float = 300.0
     max_cursors: int = 4
     statement_timeout: float = 30.0
+    keepalive: float = 120.0  # ssh ServerAliveInterval + TCP keepalives_idle + pool max_idle
+    connect_timeout: float = 5.0  # fail fast instead of hanging on dead hosts
 
     def as_dict(self) -> dict:
         return {
@@ -52,6 +54,8 @@ class Limits:
             "cursor_ttl_s": self.cursor_ttl,
             "max_cursors": self.max_cursors,
             "statement_timeout_s": self.statement_timeout,
+            "keepalive_s": self.keepalive,
+            "connect_timeout_s": self.connect_timeout,
         }
 
 
@@ -80,19 +84,35 @@ class Engine:
                 # DSN host == ssh host: from the remote's view that is localhost
                 remote_host = "127.0.0.1"
             remote_port = int(ssh.get("remote_port") or info.get("port") or 5432)
-            self.tunnel = Tunnel(ssh["host"], remote_host, remote_port)
+            self.tunnel = Tunnel(ssh["host"], remote_host, remote_port, keepalive=limits.keepalive)
             overrides = {"host": "127.0.0.1", "port": self.tunnel.local_port}
 
         options = (
             f"-c statement_timeout={int(limits.statement_timeout * 1000)} "
             f"-c idle_in_transaction_session_timeout={int((limits.cursor_ttl + 60) * 1000)}"
         )
+        conninfo = make_conninfo(
+            dsn,
+            options=options,
+            connect_timeout=max(1, int(limits.connect_timeout)),
+            # TCP keepalives: detect dead peers (~30s) even on pinned cursor
+            # connections that never touch the pool's checkout check
+            keepalives=1,
+            keepalives_idle=max(1, int(limits.keepalive)),
+            keepalives_interval=10,
+            keepalives_count=3,
+            **overrides,
+        )
         self.pool = ConnectionPool(
-            make_conninfo(dsn, options=options, **overrides),
+            conninfo,
             min_size=0,
             max_size=limits.max_cursors + 2,
+            max_idle=limits.keepalive,
             open=False,
             configure=self._configure_conn,
+            # validate every checked-out connection with a cheap round-trip;
+            # a stale one is discarded and replaced transparently
+            check=ConnectionPool.check_connection,
         )
         self.pool.open()  # min_size=0: marks the pool usable, connects nothing
 
@@ -464,7 +484,7 @@ class Manager:
 
     def _probe(self, dsn: str):
         t0 = time.monotonic()
-        with psycopg.connect(dsn, connect_timeout=5) as conn:
+        with psycopg.connect(dsn, connect_timeout=max(1, int(self.limits.connect_timeout))) as conn:
             version = conn.execute("select version()").fetchone()[0]
         return version.split(" on ")[0], round((time.monotonic() - t0) * 1000, 1)
 
@@ -690,6 +710,18 @@ def run():
     parser.add_argument("--cursor-ttl", type=float, default=300.0)
     parser.add_argument("--max-cursors", type=int, default=4)
     parser.add_argument("--statement-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--keepalive",
+        type=float,
+        default=120.0,
+        help="seconds: ssh ServerAliveInterval, TCP keepalives_idle, pool max_idle",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=5.0,
+        help="seconds before a connection attempt to a dead host fails",
+    )
     args = parser.parse_args()
 
     store = ProfileStore(args.profiles)
@@ -712,6 +744,8 @@ def run():
             cursor_ttl=args.cursor_ttl,
             max_cursors=args.max_cursors,
             statement_timeout=args.statement_timeout,
+            keepalive=args.keepalive,
+            connect_timeout=args.connect_timeout,
         ),
     )
     try:

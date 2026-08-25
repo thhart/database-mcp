@@ -94,8 +94,25 @@ claude mcp add database -- database-mcp --dsn postgresql://user@host:5432/db
 
 Options: `--profiles FILE`, `--allow-writes`, `--page-size 50`,
 `--max-page-size 500`, `--max-page-bytes 32000`, `--max-cell 400`,
-`--cursor-ttl 300`, `--max-cursors 4`, `--statement-timeout 30`.
+`--cursor-ttl 300`, `--max-cursors 4`, `--statement-timeout 30`,
+`--keepalive 120`, `--connect-timeout 5`.
 Env: `DATABASE_MCP_DSN` / `DATABASE_URL`, `DATABASE_MCP_PROFILES`.
+
+## Staleness handling
+
+Dead connections are detected fast at every layer instead of hanging:
+
+- **SSH tunnels**: `ServerAliveInterval` = `--keepalive` (default 2 min) with
+  `ServerAliveCountMax=1` — one missed probe ends the tunnel process, which
+  the engine manager detects on next use and rebuilds lazily.
+- **DB connections**: TCP keepalives (`keepalives_idle` = `--keepalive`,
+  probes every 10 s, 3 misses) catch dead peers in ~30 s — including pinned
+  cursor connections outside the pool.
+- **Pool checkout check**: every connection handed out is validated with a
+  cheap round-trip; a stale one is discarded and replaced transparently —
+  the caller never sees the error. Idle pooled connections are recycled
+  after `--keepalive` seconds; connection attempts fail after
+  `--connect-timeout` (default 5 s) instead of the ~2 min TCP default.
 
 ## Tests
 

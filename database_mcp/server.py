@@ -20,7 +20,7 @@ from psycopg_pool import ConnectionPool
 
 from mcp.server import MCPServer
 
-from . import discovery, render
+from . import bulk, discovery, render
 from .pager import CursorExpired, CursorRegistry
 from .profiles import ProfileStore, redact_dsn
 from .tunnel import Tunnel, TunnelError
@@ -138,20 +138,22 @@ class Engine:
         self.pool.open()
         params = args.get("params") or None
         page_size = clamp_page_size(args, self.limits)
+        timeout_s = args.get("timeout_s")
 
         if CURSORABLE.match(sql):
             try:
-                return self._query_cursor(sql, params, page_size)
+                return self._query_cursor(sql, params, page_size, timeout_s)
             except psycopg.errors.ProgrammingError as e:
                 # e.g. data-modifying CTE: not DECLARE-able -> plain execution
                 if "cursor" not in str(e).lower():
                     raise
-        return self._query_plain(sql, params, page_size)
+        return self._query_plain(sql, params, page_size, timeout_s)
 
-    def _query_cursor(self, sql: str, params, page_size: int) -> dict:
+    def _query_cursor(self, sql: str, params, page_size: int, timeout_s=None) -> dict:
         estimated = self._estimate_rows(sql, params)
         conn = self.pool.getconn()
         try:
+            bulk.apply_timeout(conn, timeout_s)
             cur = conn.cursor(name="pg_" + os.urandom(4).hex())
             cur.execute(sql, params)
             pq = self.registry.open(conn, cur, None, self.pool, self.name)
@@ -162,7 +164,11 @@ class Engine:
                 pass
             self.pool.putconn(conn)
             raise
-        rows, has_more = pq.fetch_page(page_size, self.limits.max_page_bytes, self.limits.max_cell)
+        try:
+            rows, has_more = pq.fetch_page(page_size, self.limits.max_page_bytes, self.limits.max_cell)
+        except Exception:
+            self.registry.close(pq.token)  # aborted txn must not pin a connection
+            raise
         # description is reliably populated once the first row was fetched
         columns = [d.name for d in pq.cursor.description] if pq.cursor.description else []
         page = {"returned": len(rows), "has_more": has_more}
@@ -174,8 +180,9 @@ class Engine:
             self.registry.close(pq.token)
         return {"columns": columns, "rows": rows, "page": page}
 
-    def _query_plain(self, sql: str, params, page_size: int) -> dict:
+    def _query_plain(self, sql: str, params, page_size: int, timeout_s=None) -> dict:
         with self.pool.connection() as conn:
+            bulk.apply_timeout(conn, timeout_s)
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 if cur.description is None:
@@ -309,6 +316,8 @@ class Manager:
                 "tables": lambda a: self.engine(a.get("profile")).tables(a),
                 "describe": lambda a: self.engine(a.get("profile")).describe(a),
                 "explain": lambda a: self.engine(a.get("profile")).explain(a),
+                "script": lambda a: bulk.script(self.engine(a.get("profile")), a),
+                "export": lambda a: bulk.export(self.engine(a.get("profile")), a),
                 "overview": lambda a: discovery.overview(self.engine(a.get("profile")), a),
                 "search_objects": lambda a: discovery.search_objects(self.engine(a.get("profile")), a),
                 "profile": lambda a: discovery.profile(self.engine(a.get("profile")), a),
@@ -371,7 +380,11 @@ class Manager:
                 f"ssh tunnel for profile '{pq.profile}' went down — its cursors "
                 "are invalidated; re-run the query (the tunnel restarts automatically)"
             )
-        rows, has_more = pq.fetch_page(page_size, self.limits.max_page_bytes, self.limits.max_cell)
+        try:
+            rows, has_more = pq.fetch_page(page_size, self.limits.max_page_bytes, self.limits.max_cell)
+        except Exception:
+            self.registry.close(token)  # dead connection/aborted txn: release
+            raise
         columns = [d.name for d in pq.cursor.description] if pq.cursor.description else []
         page = {
             "returned": len(rows),
@@ -554,7 +567,11 @@ def build_server(mgr: Manager) -> MCPServer:
             "PAGING: run SQL with `query`; when page.has_more is true, continue "
             "with `fetch(cursor)` — the query is NOT re-executed, rows continue "
             "from a held server-side cursor with a stable MVCC snapshot. "
-            "Results are compact: columns once, rows as arrays.\n"
+            "Results are compact: columns once, rows as arrays. For several "
+            "related queries use `script` (one transaction, every result set "
+            "back, labeled); for large results use `export` (streams to a "
+            "local csv/jsonl file, nothing enters the context). Long analysis "
+            "queries: pass timeout_s.\n"
             "\n"
             "UNKNOWN SCHEMA? Do NOT explore with ad-hoc SQL scans:\n"
             "- `overview` — every table + row estimate + column names, one call\n"
@@ -591,9 +608,58 @@ def build_server(mgr: Manager) -> MCPServer:
         params: list | None = None,
         page_size: int | None = None,
         profile: str | None = None,
+        timeout_s: float | None = None,
     ) -> str:
         return await _call(
-            "query", {"sql": sql, "params": params, "page_size": page_size, "profile": profile}
+            "query",
+            {"sql": sql, "params": params, "page_size": page_size,
+             "profile": profile, "timeout_s": timeout_s},
+        )
+
+    @srv.tool(
+        description=(
+            "Run a multi-statement SQL script in ONE transaction and get EVERY "
+            "result set back, each labeled by the comment line preceding its "
+            "statement. Made for analysis sessions: several related queries in "
+            "one round-trip instead of one call per query. Rows per statement "
+            "are capped (rows_per_statement); use query+fetch for paging "
+            "through one big result."
+        )
+    )
+    async def script(
+        sql: str,
+        rows_per_statement: int | None = None,
+        profile: str | None = None,
+        timeout_s: float | None = None,
+    ) -> str:
+        return await _call(
+            "script",
+            {"sql": sql, "rows_per_statement": rows_per_statement,
+             "profile": profile, "timeout_s": timeout_s},
+        )
+
+    @srv.tool(
+        description=(
+            "Stream a FULL result set into a local file (csv or jsonl) via a "
+            "server-side cursor — any size, nothing enters the conversation "
+            "context. Returns path, columns, row count, bytes. Use for "
+            "materializing large analysis results for local tooling "
+            "(pandas, duckdb, ...)."
+        )
+    )
+    async def export(
+        sql: str,
+        format: str = "csv",
+        path: str | None = None,
+        max_rows: int = 1_000_000,
+        params: list | None = None,
+        profile: str | None = None,
+        timeout_s: float | None = None,
+    ) -> str:
+        return await _call(
+            "export",
+            {"sql": sql, "format": format, "path": path, "max_rows": max_rows,
+             "params": params, "profile": profile, "timeout_s": timeout_s},
         )
 
     @srv.tool(

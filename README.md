@@ -70,6 +70,8 @@ profile_add(name="prod", dsn="postgresql://app@dbhost:5432/app",
 | `tables` | List tables/views with row estimates and sizes |
 | `describe` | Columns, constraints, indexes of one table |
 | `explain` | Query plan (optionally `analyze`) |
+| `script` | Multi-statement SQL in one transaction — every result set back, labeled by preceding comments |
+| `export` | Stream a full result set to a local csv/jsonl file via server-side cursor — any size, zero context cost |
 | `overview` | Orientation card: every table + row estimate + column names in one call |
 | `search_objects` | Find tables/columns/functions by name **or comment** |
 | `profile` | Column statistics from `pg_stats` — distributions without a scan |

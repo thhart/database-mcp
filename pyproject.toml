@@ -1,0 +1,34 @@
+[project]
+name = "database-mcp"
+version = "0.1.0"
+description = "SQL database MCP server with true server-side result paging (PostgreSQL reference implementation)"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Thomas Hartwig", email = "thomas.hartwig@gmail.com"}
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+database-mcp = "database_mcp.server:run"
+
+[project.urls]
+Homepage = "https://github.com/thhart/database-mcp"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["database_mcp*"]
